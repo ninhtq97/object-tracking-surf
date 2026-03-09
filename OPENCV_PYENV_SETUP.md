@@ -8,6 +8,76 @@ Khi dùng pyenv, Python được cài vào `/Users/<user>/.pyenv/versions/<versi
 2. **Python bindings không install vào đúng site-packages**
 3. **Built library conflict với system Python**
 
+---
+
+## 🚀 Cách Setup Nhanh với Makefile (Khuyến nghị)
+
+Chúng tôi đã cung cấp `Makefile` để tự động hóa toàn bộ quy trình. Đây là cách nhanh nhất:
+
+### Setup Tự động (Một lệnh)
+
+```bash
+# Chạy toàn bộ: kiểm tra -> cài deps -> download -> build -> install -> verify
+make all
+```
+
+### Các lệnh Makefile hữu ích
+
+```bash
+# Hiển thị trợ giúp và danh sách targets
+make help
+
+# Chỉ kiểm tra pyenv setup
+make check-pyenv
+
+# Chỉ download OpenCV source
+make download-opencv
+
+# Chỉ configure CMake
+make configure
+
+# Chỉ build (sau khi configure)
+make build
+
+# Chỉ install (sau khi build)
+make install
+
+# Kiểm tra cài đặt
+make verify
+
+# Rebuild nhanh (không configure lại)
+make rebuild
+
+# Xem build log
+make show-log
+
+# Xóa build directory
+make clean
+
+# Xóa toàn bộ source và build
+make clean-all
+```
+
+### Chạy từng bước (nếu cần debug)
+
+```bash
+make check-pyenv      # 1. Kiểm tra môi trường
+make install-deps     # 2. Cài dependencies
+make download-opencv  # 3. Download source
+make configure        # 4. Configure CMake
+make build           # 5. Build (30-60 phút)
+make install         # 6. Install
+make verify          # 7. Kiểm tra
+```
+
+**Lưu ý cho Linux/WSL:** Nếu dùng Linux/WSL, chạy `make configure-linux` thay vì `make configure`.
+
+---
+
+## 📖 Hướng dẫn Chi tiết Thủ công
+
+Nếu bạn muốn hiểu rõ từng bước hoặc gặp vấn đề với Makefile, làm theo hướng dẫn thủ công bên dưới.
+
 ## Kiểm tra Pyenv Setup
 
 ```bash

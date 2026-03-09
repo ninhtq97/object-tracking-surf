@@ -1,103 +1,162 @@
-# Object Detection using SURF
+# SURF Feature Matching
 
-Phát hiện đặc trưng SURF (Speeded-Up Robust Features)
+So khớp đặc trưng SURF (Speeded-Up Robust Features) giữa 2 ảnh
+
+📖 **[Quick Start Guide](QUICKSTART.md)** | 📋 **[OpenCV Setup với Pyenv](OPENCV_PYENV_SETUP.md)**
 
 ## Mô tả
 
-Dự án này triển khai thuật toán phát hiện đặc trưng **SURF** theo tài liệu OpenCV 3.4.
+Dự án này triển khai thuật toán **so khớp đặc trưng SURF** giữa hai ảnh theo tài liệu OpenCV 3.4.
 
-- **SURF**: Thuật toán nonfree, yêu cầu build OpenCV với `OPENCV_ENABLE_NONFREE=ON` (module `xfeatures2d`).
+- **SURF**: Thuật toán nonfree, yêu cầu build OpenCV với `OPENCV_ENABLE_NONFREE=ON` (module `xfeatures2d`)
+- Chương trình phát hiện đặc trưng SURF trong hai ảnh và tìm các điểm tương ứng giữa chúng
 
 ## Cài đặt
 
 ### Yêu cầu
 
 - Python 3.6+
-- OpenCV (opencv-python hoặc opencv-contrib-python)
+- OpenCV với SURF support (yêu cầu build từ source với `OPENCV_ENABLE_NONFREE=ON`)
 
 ### Cài đặt thư viện
 
 ```bash
 # Cài đặt phụ thuộc cơ bản
-pip install opencv-contrib-python numpy
-
-# OpenCV có SURF cần build thủ công với nonfree (xem bên dưới)
+pip install numpy
 ```
 
-**Lưu ý:**
+**Lưu ý quan trọng:**
 
-- SURF yêu cầu OpenCV được build với `OPENCV_ENABLE_NONFREE=ON` và module `opencv_contrib/xfeatures2d`.
+- SURF yêu cầu OpenCV được build với `OPENCV_ENABLE_NONFREE=ON` và module `opencv_contrib/xfeatures2d`
+- OpenCV từ pip (`opencv-python`, `opencv-contrib-python`) **KHÔNG** có SURF
+- Bạn cần build OpenCV từ source
+
+### Build OpenCV với SURF Support
+
+#### Cách 1: Tự động với Makefile (Khuyến nghị)
+
+```bash
+# Chạy một lệnh để build toàn bộ (macOS/Linux/WSL)
+make all
+```
+
+Makefile sẽ tự động:
+- Kiểm tra pyenv setup
+- Cài đặt dependencies (cmake, pkg-config, v.v.)
+- Download OpenCV và opencv_contrib source
+- Configure CMake với `OPENCV_ENABLE_NONFREE=ON`
+- Build và install vào pyenv environment
+- Verify cài đặt
+
+**Các lệnh hữu ích:**
+```bash
+make help           # Xem trợ giúp
+make check-pyenv    # Kiểm tra pyenv
+make verify         # Kiểm tra sau khi build
+make clean          # Xóa build directory
+```
+
+#### Cách 2: Build thủ công
+
+Xem hướng dẫn chi tiết trong [OPENCV_PYENV_SETUP.md](OPENCV_PYENV_SETUP.md) để build thủ công từng bước.
+
+**Tóm tắt:**
+1. Cài dependencies: `cmake`, `pkg-config`, etc.
+2. Download OpenCV và opencv_contrib từ GitHub
+3. Configure với CMake (set `OPENCV_ENABLE_NONFREE=ON`)
+4. Build: `make -j$(nproc)`
+5. Install: `make install`
+
+### Kiểm tra cài đặt
+
+```bash
+# Kiểm tra OpenCV version
+python3 -c "import cv2; print(cv2.__version__)"
+
+# Kiểm tra SURF có hoạt động không
+python3 -c "import cv2; surf = cv2.xfeatures2d.SURF_create(); print('✓ SURF works!')"
+
+# Hoặc dùng Makefile
+make verify
+```
 
 ## Cách sử dụng
 
 ### Chạy chương trình
 
 ```bash
-# Phát hiện đặc trưng SURF trong 1 ảnh
-python main.py path/to/image.jpg
-
-# Với hessian threshold tùy chỉnh
-python main.py path/to/image.jpg --hessian 300
+# So khớp đặc trưng SURF giữa 2 ảnh
+python main.py path/to/image1.jpg path/to/image2.jpg
 
 # Chỉ định thư mục output
-python main.py path/to/image.jpg --output-dir my_outputs
+python main.py path/to/image1.jpg path/to/image2.jpg --output-dir my_outputs
 
 # Ví dụ với ảnh trong data
-python main.py ./data/imagenette2-320/train/n01440764/ILSVRC2012_val_00000293.JPEG
+python main.py ./data/messi_1.jpg ./data/messi_2.jpg
 ```
 
-### Quy trình theo yêu cầu (2 bước)
+### Quy trình hoạt động
 
-1. **Chuẩn bị dữ liệu**: Đặt ảnh cần phát hiện đặc trưng vào thư mục `data/` hoặc bất kỳ đâu.
-2. **Chạy phát hiện SURF**: Truyền đường dẫn ảnh vào chương trình:
+1. **Chuẩn bị dữ liệu**: Đặt 2 ảnh cần so khớp vào thư mục `data/` hoặc bất kỳ đâu
+2. **Chạy so khớp SURF**: Truyền đường dẫn 2 ảnh vào chương trình:
 
 ```bash
-python main.py path/to/image.jpg
+python main.py image1.jpg image2.jpg
 ```
 
 Kết quả sẽ được lưu trong thư mục `outputs/` với:
 
-- `*_surf_detected.jpg`: Ảnh với keypoints được vẽ
-- `*_surf_info.txt`: Thông tin chi tiết về keypoints
+- `image1_surf_info.txt`: Thông tin keypoints của ảnh 1
+- `image2_surf_info.txt`: Thông tin keypoints của ảnh 2
+- `image1_vs_image2_surf_match.jpg`: Ảnh kết hợp (composite) bao gồm:
+  - Panel trên: Ảnh 1 với keypoints được vẽ
+  - Panel giữa: Ảnh 2 với keypoints được vẽ
+  - Panel dưới: Đường nối giữa các keypoints so khớp
 
 ### Đầu vào và đầu ra
 
 **Đầu vào:**
 
-- Đường dẫn đến 1 ảnh (`.jpg`, `.jpeg`, `.png`, ...)
-- Tùy chọn: `--hessian` để điều chỉnh độ nhạy (mặc định 400)
+- Đường dẫn đến ảnh gốc/tham chiếu (image1)
+- Đường dẫn đến ảnh cần so khớp (image2)
+- Tùy chọn: `--output-dir` để chỉ định thư mục lưu kết quả (mặc định: `outputs`)
 
 **Đầu ra:**
 
-- `outputs/*_surf_detected.jpg`: Ảnh với keypoints SURF được đánh dấu (vòng tròn với hướng)
-- `outputs/*_surf_info.txt`: Thông tin chi tiết keypoints (tọa độ, size, angle, response)
+- `image1_surf_info.txt`: Thông tin chi tiết keypoints của ảnh 1 (tọa độ, size, angle, response)
+- `image2_surf_info.txt`: Thông tin chi tiết keypoints của ảnh 2
+- `image1_vs_image2_surf_match.jpg`: Ảnh kết hợp 3 panel:
+  - Panel 1: Ảnh 1 với keypoints SURF được đánh dấu
+  - Panel 2: Ảnh 2 với keypoints SURF được đánh dấu
+  - Panel 3: Đường nối giữa các keypoints so khớp (tối đa 100 matches tốt nhất)
 
 ## Cách hoạt động
 
-### SURF (Speeded-Up Robust Features)
+### 1. SURF (Speeded-Up Robust Features)
 
-- Yêu cầu OpenCV build với `OPENCV_ENABLE_NONFREE=ON` và `opencv_contrib` (`xfeatures2d`).
-- Robust với scale và rotation, descriptor dạng float.
-- Tham số chính: Hessian threshold (mặc định 400).
+- Yêu cầu OpenCV build với `OPENCV_ENABLE_NONFREE=ON` và `opencv_contrib` (`xfeatures2d`)
+- Robust với scale và rotation, descriptor dạng float
+- Tham số chính: Hessian threshold (cố định = 400 trong code)
 
-### 2. Quy trình phát hiện đặc trưng
+### 2. Quy trình so khớp đặc trưng
 
-1. **Đọc ảnh:** Đọc ảnh đầu vào và chuyển sang grayscale
-2. **Khởi tạo SURF:** Tạo detector SURF với hessian threshold
-3. **Phát hiện keypoints:** SURF phát hiện các điểm đặc trưng (corners, blobs)
-4. **Tính descriptors:** Tính descriptor 64/128 chiều cho mỗi keypoint
-5. **Vẽ và lưu:** Vẽ keypoints lên ảnh gốc và lưu kết quả
+1. **Đọc 2 ảnh:** Đọc cả hai ảnh đầu vào và chuyển sang grayscale
+2. **Khởi tạo SURF:** Tạo detector SURF với hessian threshold = 400
+3. **Phát hiện keypoints:** SURF phát hiện các điểm đặc trưng trong cả 2 ảnh
+4. **Tính descriptors:** Tính descriptor cho mỗi keypoint của cả 2 ảnh
+5. **So khớp đặc trưng:** Sử dụng BFMatcher (Brute Force Matcher) với NORM_L2 và crossCheck=True
+6. **Sắp xếp matches:** Sắp xếp theo distance và lấy tối đa 100 matches tốt nhất
+7. **Vẽ và lưu:**
+   - Vẽ keypoints lên mỗi ảnh
+   - Vẽ đường nối giữa các keypoints so khớp
+   - Ghép 3 panel thành 1 ảnh composite theo chiều dọc
 
-### 3. Tham số quan trọng
+### 3. Các hàm chính
 
-- **hessian (400):** Ngưỡng Hessian cho SURF. Giá trị cao hơn = ít keypoints hơn nhưng chất lượng cao hơn
-- **output_dir (outputs):** Thư mục lưu kết quả
-
-## Cấu trúc code
-
-### Function `detect_surf_features()`
-
-Hàm chính phát hiện đặc trưng SURF:
+- **detect_surf_features(image_path, output_dir):** Phát hiện keypoints SURF trong 1 ảnh
+- **match_two_images(image1_path, image2_path, output_dir):** So khớp SURF giữa 2 ảnh
+- **parse_args():** Xử lý command-line arguments
+- **main():** Hàm chính điều khiển luồng chương trình
 
 - Đọc và xử lý ảnh
 - Khởi tạo SURF detector
