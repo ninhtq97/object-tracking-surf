@@ -10,7 +10,7 @@ RED    := \033[0;31m
 NC     := \033[0m # No Color
 
 # Biến môi trường
-BUILD_DIR := $(HOME)/opencv_build
+BUILD_DIR := $(CURDIR)/.opencv_build
 OPENCV_DIR := $(BUILD_DIR)/opencv
 CONTRIB_DIR := $(BUILD_DIR)/opencv_contrib
 BUILD_TARGET := $(OPENCV_DIR)/build

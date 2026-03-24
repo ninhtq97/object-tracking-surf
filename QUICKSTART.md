@@ -30,14 +30,25 @@ python3 verify_opencv.py
 make verify
 ```
 
-### Bước 3: Chạy chương trình
+### Bước 3: Cài thư viện Python của project
 
 ```bash
-# So khớp 2 ảnh
+pip install -r requirements.txt
+```
+
+Lưu ý: OpenCV có SURF vẫn cần build từ source (đã xử lý ở Bước 1).
+
+### Bước 4: Chạy chương trình
+
+```bash
+# Chế độ CLI: so khớp 2 ảnh
 python main.py image1.jpg image2.jpg
 
 # Ví dụ với ảnh trong data/
 python main.py data/messi_1.jpg data/messi_2.jpg
+
+# Chế độ UI: mở giao diện Gradio
+python main.py
 ```
 
 ## 📋 Các Lệnh Makefile Hữu Ích
@@ -130,7 +141,13 @@ outputs/
 make all                    # Setup toàn bộ
 
 # Mỗi lần sử dụng
+pip install -r requirements.txt    # Chỉ cần chạy khi chưa cài deps
+
+# Chạy CLI
 python main.py img1.jpg img2.jpg
+
+# Hoặc chạy UI
+python main.py --ui
 
 # Nếu cần rebuild OpenCV
 make rebuild

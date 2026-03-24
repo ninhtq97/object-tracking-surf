@@ -21,9 +21,16 @@ Dự án này triển khai thuật toán **so khớp đặc trưng SURF** giữa
 ### Cài đặt thư viện
 
 ```bash
-# Cài đặt phụ thuộc cơ bản
-pip install numpy
+# Cài thư viện Python cho project
+pip install -r requirements.txt
 ```
+
+`requirements.txt` bao gồm:
+
+- `numpy`: xử lý mảng ảnh và ghép panel kết quả
+- `gradio`: chạy giao diện web để upload 2 ảnh và xem kết quả trực quan
+
+Lưu ý: OpenCV có SURF (`cv2.xfeatures2d.SURF_create`) **không** cài qua pip, cần build từ source như hướng dẫn bên dưới.
 
 **Lưu ý quan trọng:**
 
@@ -82,7 +89,12 @@ make verify
 
 ## Cách sử dụng
 
-### Chạy chương trình
+Project hỗ trợ 2 chế độ chạy:
+
+- **CLI mode**: truyền đường dẫn 2 ảnh qua command line
+- **UI mode**: mở giao diện Gradio để upload 2 ảnh trực tiếp
+
+### 1) Chạy CLI (khuyến nghị cho script)
 
 ```bash
 # So khớp đặc trưng SURF giữa 2 ảnh
@@ -91,27 +103,46 @@ python main.py path/to/image1.jpg path/to/image2.jpg
 # Chỉ định thư mục output
 python main.py path/to/image1.jpg path/to/image2.jpg --output-dir my_outputs
 
-# Ví dụ với ảnh trong data
+# Ví dụ với ảnh mẫu trong data
 python main.py ./data/messi_1.jpg ./data/messi_2.jpg
 ```
 
-### Quy trình hoạt động
-
-1. **Chuẩn bị dữ liệu**: Đặt 2 ảnh cần so khớp vào thư mục `data/` hoặc bất kỳ đâu
-2. **Chạy so khớp SURF**: Truyền đường dẫn 2 ảnh vào chương trình:
+### 2) Chạy giao diện web (Gradio)
 
 ```bash
-python main.py image1.jpg image2.jpg
+# Mở giao diện web
+python main.py
+
+# Mở UI và đổi thư mục output
+python main.py --ui --output-dir my_outputs
 ```
 
-Kết quả sẽ được lưu trong thư mục `outputs/` với:
+Sau khi mở UI:
 
-- `image1_surf_info.txt`: Thông tin keypoints của ảnh 1
-- `image2_surf_info.txt`: Thông tin keypoints của ảnh 2
-- `image1_vs_image2_surf_match.jpg`: Ảnh kết hợp (composite) bao gồm:
-  - Panel trên: Ảnh 1 với keypoints được vẽ
-  - Panel giữa: Ảnh 2 với keypoints được vẽ
-  - Panel dưới: Đường nối giữa các keypoints so khớp
+1. Upload ảnh 1 và ảnh 2
+2. Bấm nút **Trích xuất đặc trưng 2 ảnh**
+3. Xem ảnh kết quả và trạng thái keypoints/matches
+
+### 3) Hành vi mặc định khi không truyền ảnh
+
+Nếu chạy:
+
+```bash
+python main.py
+```
+
+chương trình sẽ tự động chuyển sang **UI mode**.
+
+### Kết quả đầu ra
+
+Kết quả được lưu trong thư mục output (mặc định là `outputs/`):
+
+- `image1_surf_info.txt`: thông tin keypoints của ảnh 1
+- `image2_surf_info.txt`: thông tin keypoints của ảnh 2
+- `image1_vs_image2_surf_match.jpg`: ảnh composite gồm:
+  - Panel trên: ảnh 1 với keypoints
+  - Panel giữa: ảnh 2 với keypoints
+  - Panel dưới: các đường nối match tốt nhất (tối đa 100)
 
 ### Đầu vào và đầu ra
 
