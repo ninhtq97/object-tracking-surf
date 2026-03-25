@@ -4,329 +4,275 @@ import cv2
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-MIN_GOOD_MATCHES = 4       # tối thiểu cho homography
-MIN_MEDIAN_MATCHES = 2     # tối thiểu cho fallback median-shift
-LOWE_RATIO = 0.8           # ratio test (nới ra cho ROI nhỏ)
-SEARCH_MARGIN = 2.5        # mở rộng vùng search quanh vị trí cuối
-MAX_AREA_CHANGE = 3.0      # bbox mới không được > 3x hoặc < 1/3 bbox cũ
-CONTEXT_PAD = 0.3           # mở rộng ROI thêm 30% mỗi chiều khi init (lấy context)
-TEMPLATE_THRESH = 0.45      # ngưỡng NCC cho template matching fallback
-ADAPT_INTERVAL = 5          # chỉ update model mỗi N frames thành công (tránh drift)
+
+def create_tracker():
+    """Tạo SURF-based tracker sử dụng ORB features + matching"""
+    return SurfTracker()
 
 
 class SurfTracker:
-    """SURF feature-based tracker + template matching fallback.
-    API tương thích: init(frame, bbox) -> bool, update(frame) -> (ok, bbox)
-    """
+    """Feature-based tracker sử dụng ORB (SURF alternative) + CSRT + Template Matching"""
+    def __init__(self):
+        self.orb = cv2.ORB_create(nfeatures=2000)
+        self.akaze = cv2.AKAZE_create()
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.detector = self.orb
 
-    def __init__(self, hessian_threshold=100):
-        self.surf = cv2.xfeatures2d.SURF_create(hessian_threshold)
-        self.surf.setExtended(True)   # 128-dim descriptors
-        self.bf = cv2.BFMatcher(cv2.NORM_L2)  # BF ổn định hơn FLANN cho ít features
+        self.csrt_tracker = None
+        self.use_csrt = False
+        self.use_template = False
+        self.last_error = ""
 
-        self.ref_kp = None
-        self.ref_des = None
-        self.ref_pts = None       # 4 corners của ROI gốc (float32)
-        self.last_bbox = None     # (x, y, w, h) vị trí cuối
-        self.init_area = 0
-        self.lost_count = 0
-        self.success_count = 0    # đếm frames tracking OK liên tiếp
+        self.roi_frame = None
+        self.roi_kp = None
+        self.roi_des = None
+        self.roi_bbox = None
+        self.roi_template = None
+        self.initialized = False
 
-        # template matching
-        self.ref_template = None  # grayscale template từ init
-        self.ref_bbox_wh = (0, 0)  # (w, h) gốc
-
-        # context-expanded reference (cho SURF matching chính xác hơn)
-        self.ref_kp_ctx = None
-        self.ref_des_ctx = None
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     def init(self, frame, bbox):
-        """Khởi tạo tracker với frame và bbox = (x, y, w, h)."""
-        x, y, w, h = [int(v) for v in bbox]
+        """Khởi tạo tracker với ROI - robust multi-fallback initialization"""
+        self.last_error = ""
+        self.use_template = False
+        self.use_csrt = False
+
         fh, fw = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # --- Lưu template gốc cho NCC fallback ---
-        roi_tmpl = gray[y:y+h, x:x+w].copy()
-        self.ref_template = roi_tmpl
-        self.ref_bbox_wh = (w, h)
-
-        # --- Mở rộng ROI lấy context cho SURF (nhiều features hơn) ---
-        pad_x = int(w * CONTEXT_PAD)
-        pad_y = int(h * CONTEXT_PAD)
-        cx1 = max(0, x - pad_x)
-        cy1 = max(0, y - pad_y)
-        cx2 = min(fw, x + w + pad_x)
-        cy2 = min(fh, y + h + pad_y)
-        roi_ctx = gray[cy1:cy2, cx1:cx2]
-
-        kp_ctx, des_ctx = self.surf.detectAndCompute(roi_ctx, None)
-        if des_ctx is not None and len(kp_ctx) >= MIN_MEDIAN_MATCHES:
-            for k in kp_ctx:
-                k.pt = (k.pt[0] + cx1, k.pt[1] + cy1)
-            self.ref_kp_ctx = kp_ctx
-            self.ref_des_ctx = des_ctx.astype(np.float32)
-
-        # --- SURF trên ROI chính xác ---
-        roi = gray[y:y+h, x:x+w]
-        kp, des = self.surf.detectAndCompute(roi, None)
-
-        # Nếu ROI chính ko đủ features, dùng context features
-        if des is None or len(kp) < MIN_MEDIAN_MATCHES:
-            if self.ref_des_ctx is not None:
-                self.ref_kp = list(self.ref_kp_ctx)
-                self.ref_des = self.ref_des_ctx.copy()
-            else:
-                # Cả 2 đều fail nhưng vẫn có template matching
-                self.ref_kp = None
-                self.ref_des = None
-        else:
-            for k in kp:
-                k.pt = (k.pt[0] + x, k.pt[1] + y)
-            self.ref_kp = kp
-            self.ref_des = des.astype(np.float32)
-
-        # Cần ít nhất template HOẶC SURF features
-        if self.ref_des is None and self.ref_template is None:
-            return False
-
-        self.ref_pts = np.float32([
-            [x, y], [x + w, y], [x + w, y + h], [x, y + h]
-        ]).reshape(-1, 1, 2)
-        self.last_bbox = (x, y, w, h)
-        self.init_area = w * h
-        self.lost_count = 0
-        self.success_count = 0
-        return True
-
-    def _validate_bbox(self, x, y, w, h, fw, fh):
-        if w < 5 or h < 5 or w > fw or h > fh:
-            return False
-        area = w * h
-        if self.init_area > 0:
-            ratio = area / self.init_area
-            if ratio > MAX_AREA_CHANGE or ratio < (1.0 / MAX_AREA_CHANGE):
-                return False
-        # aspect ratio check: prevent degenerate bbox from homography
-        if self.ref_bbox_wh[0] > 0 and self.ref_bbox_wh[1] > 0:
-            orig_ar = self.ref_bbox_wh[0] / self.ref_bbox_wh[1]
-            new_ar = w / h
-            ar_ratio = new_ar / orig_ar if orig_ar > 0 else 1.0
-            if ar_ratio > 2.0 or ar_ratio < 0.5:
-                return False
-        return True
-
-    def _validate_homography(self, H):
-        if H is None:
-            return False
-        det = np.linalg.det(H[:2, :2])
-        if det < 0.1 or det > 10.0:
-            return False
-        return True
-
-    def _median_shift_bbox(self, src_pts, dst_pts):
-        dx = np.median(dst_pts[:, 0, 0] - src_pts[:, 0, 0])
-        dy = np.median(dst_pts[:, 0, 1] - src_pts[:, 0, 1])
-        lx, ly, lw, lh = self.last_bbox
-        nx = int(round(lx + dx))
-        ny = int(round(ly + dy))
-        return nx, ny, lw, lh
-
-    def _template_match(self, gray, fw, fh):
-        """Template matching (NCC) trong search region. Return (ok, (x,y,w,h))."""
-        if self.ref_template is None:
-            return False, (0, 0, 0, 0)
-
-        tw, th = self.ref_bbox_wh
-        lx, ly, lw, lh = self.last_bbox
-
-        # search region
-        margin = max(tw, th) * 3
-        sx = max(0, int(lx - margin))
-        sy = max(0, int(ly - margin))
-        ex = min(fw, int(lx + lw + margin))
-        ey = min(fh, int(ly + lh + margin))
-        search_roi = gray[sy:ey, sx:ex]
-
-        if search_roi.shape[0] < th or search_roi.shape[1] < tw:
-            return False, (0, 0, 0, 0)
-
-        # multi-scale template matching
-        best_val = -1
-        best_loc = None
-        best_scale = 1.0
-
-        for scale in [0.9, 0.95, 1.0, 1.05, 1.1]:
-            sw = max(5, int(tw * scale))
-            sh = max(5, int(th * scale))
-            if sw >= search_roi.shape[1] or sh >= search_roi.shape[0]:
-                continue
-            scaled_tmpl = cv2.resize(self.ref_template, (sw, sh))
-            res = cv2.matchTemplate(search_roi, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            if max_val > best_val:
-                best_val = max_val
-                best_loc = max_loc
-                best_scale = scale
-
-        if best_val < TEMPLATE_THRESH or best_loc is None:
-            return False, (0, 0, 0, 0)
-
-        rx = sx + best_loc[0]
-        ry = sy + best_loc[1]
-        rw = int(tw * best_scale)
-        rh = int(th * best_scale)
-
-        if self._validate_bbox(rx, ry, rw, rh, fw, fh):
-            return True, (rx, ry, rw, rh)
-        return False, (0, 0, 0, 0)
-
-    def _update_reference(self, frame, bbox):
-        """Cập nhật template và SURF reference (chỉ khi confidence cao)."""
         x, y, w, h = [int(v) for v in bbox]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        fh, fw = gray.shape[:2]
-        x = max(0, min(fw - w, x))
-        y = max(0, min(fh - h, y))
-        if w < 5 or h < 5:
-            return
+        x = max(0, min(fw - 1, x))
+        y = max(0, min(fh - 1, y))
+        w = max(1, min(fw - x, w))
+        h = max(1, min(fh - y, h))
 
-        # Update template (nhẹ blend)
-        new_tmpl = gray[y:y+h, x:x+w]
-        if new_tmpl.shape == self.ref_template.shape:
-            alpha = 0.15
-            self.ref_template = cv2.addWeighted(
-                self.ref_template, 1 - alpha, new_tmpl, alpha, 0)
+        if w < 8 or h < 8:
+            self.last_error = "ROI quá nhỏ (< 8x8)"
+            return False
 
-        # Update SURF features
-        if self.ref_des is None:
-            return
+        self.roi_bbox = (x, y, w, h)
+        self.roi_frame = frame[y:y+h, x:x+w].copy()
 
-        roi = gray[y:y+h, x:x+w]
-        kp_new, des_new = self.surf.detectAndCompute(roi, None)
-        if des_new is None or len(kp_new) < MIN_MEDIAN_MATCHES:
-            return
+        if self.roi_frame.size == 0:
+            self.last_error = "ROI rỗng"
+            return False
 
-        for k in kp_new:
-            k.pt = (k.pt[0] + x, k.pt[1] + y)
-        des_new = des_new.astype(np.float32)
+        # Lưu template cho fallback matching
+        self.roi_template = cv2.cvtColor(self.roi_frame, cv2.COLOR_BGR2GRAY)
 
-        # Merge: 80% cũ + 20% mới
-        n_old = max(1, int(len(self.ref_kp) * 0.8))
-        n_new = max(1, int(len(kp_new) * 0.2))
+        # Try feature-based detection với multiple preprocessing
+        roi_gray = cv2.cvtColor(self.roi_frame, cv2.COLOR_BGR2GRAY)
 
-        old_idx = sorted(range(len(self.ref_kp)),
-                         key=lambda i: self.ref_kp[i].response, reverse=True)[:n_old]
-        new_idx = sorted(range(len(kp_new)),
-                         key=lambda i: kp_new[i].response, reverse=True)[:n_new]
+        # Strategy 1: CLAHE + denoising
+        roi_prep = self.clahe.apply(roi_gray)
+        roi_prep = cv2.medianBlur(roi_prep, 3)
 
-        self.ref_kp = [self.ref_kp[i] for i in old_idx] + [kp_new[i] for i in new_idx]
-        self.ref_des = np.vstack([self.ref_des[old_idx], des_new[new_idx]])
+        kp, des = self._try_detect_features(roi_prep)
+        detector_used = "ORB"
 
-        self.ref_pts = np.float32([
-            [x, y], [x + w, y], [x + w, y + h], [x, y + h]
-        ]).reshape(-1, 1, 2)
+        # Strategy 2: Histogram equalization + AKAZE if ORB fails
+        if des is None or len(kp) < 3:
+            roi_eq = cv2.equalizeHist(roi_gray)
+            roi_eq = cv2.medianBlur(roi_eq, 3)
+            kp, des = self._try_detect_akaze(roi_eq)
+            detector_used = "AKAZE"
+
+        # Strategy 3: Simple histogram equalization
+        if des is None or len(kp) < 3:
+            roi_eq = cv2.equalizeHist(roi_gray)
+            kp, des = self.orb.detectAndCompute(roi_eq, None)
+            detector_used = "ORB+EQ"
+
+        # Success with feature detection
+        if des is not None and len(kp) >= 3:
+            self.detector = self.orb if detector_used == "ORB" else self.akaze
+            self.roi_kp = kp
+            self.roi_des = des
+            self.csrt_tracker = None
+            self.use_csrt = False
+            self.use_template = False
+            self.initialized = True
+            return True
+
+        # Fallback 1: Try CSRT tracker
+        csrt = self._create_csrt_tracker()
+        if csrt is not None:
+            try:
+                if csrt.init(frame, (x, y, w, h)):
+                    self.csrt_tracker = csrt
+                    self.use_csrt = True
+                    self.initialized = True
+                    self.last_error = ""
+                    return True
+            except:
+                pass
+
+        # Fallback 2: Template Matching (ultra-robust for simple scenes)
+        self.use_template = True
+        self.initialized = True
+        self.last_error = ""
+        return True
+
+    def _try_detect_features(self, roi_img):
+        """Try ORB with relaxed settings"""
+        try:
+            kp, des = self.orb.detectAndCompute(roi_img, None)
+            return kp, des
+        except:
+            return [], None
+
+    def _try_detect_akaze(self, roi_img):
+        """Try AKAZE as alternative detector"""
+        try:
+            kp, des = self.akaze.detectAndCompute(roi_img, None)
+            return kp, des
+        except:
+            return [], None
 
     def update(self, frame):
-        """Tìm object trong frame mới. Return (ok, (x, y, w, h))."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        fh, fw = gray.shape[:2]
+        """Cập nhật vị trí đối tượng"""
+        if not self.initialized:
+            return False, self.roi_bbox
 
-        surf_ok = False
-        sx, sy, sw, sh = 0, 0, 0, 0
+        # Template matching fallback (ultra-robust)
+        if self.use_template:
+            return self._update_template_match(frame)
 
-        # ===== Bước 1: SURF feature matching =====
-        if self.ref_des is not None and len(self.ref_des) >= MIN_MEDIAN_MATCHES:
-            margin_mult = SEARCH_MARGIN + self.lost_count * 0.5
-            margin_mult = min(margin_mult, 5.0)
+        # CSRT fallback
+        if self.use_csrt:
+            if self.csrt_tracker is None:
+                return False, self.roi_bbox
+            try:
+                ok, bbox = self.csrt_tracker.update(frame)
+                if not ok:
+                    return False, self.roi_bbox
+                x, y, w, h = [int(v) for v in bbox]
+                self.roi_bbox = (x, y, w, h)
+                return True, self.roi_bbox
+            except:
+                return False, self.roi_bbox
 
-            mask = None
-            if self.last_bbox is not None:
-                lx, ly, lw, lh = self.last_bbox
-                margin_w = int(lw * margin_mult)
-                margin_h = int(lh * margin_mult)
-                sx0 = max(0, lx - margin_w)
-                sy0 = max(0, ly - margin_h)
-                ex0 = min(fw, lx + lw + margin_w)
-                ey0 = min(fh, ly + lh + margin_h)
-                mask = np.zeros((fh, fw), dtype=np.uint8)
-                mask[sy0:ey0, sx0:ex0] = 255
+        # Feature-based tracking
+        if self.roi_des is None or len(self.roi_kp) < 3:
+            return False, self.roi_bbox
 
-            kp, des = self.surf.detectAndCompute(gray, mask)
-            if des is not None and len(kp) >= MIN_MEDIAN_MATCHES:
-                des = des.astype(np.float32)
-                try:
-                    matches = self.bf.knnMatch(self.ref_des, des, k=2)
-                    good = []
-                    for pair in matches:
-                        if len(pair) == 2:
-                            m, n = pair
-                            if m.distance < LOWE_RATIO * n.distance:
-                                good.append(m)
+        # Tìm features trong frame hiện tại
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame_prep = self.clahe.apply(frame_gray)
+        frame_prep = cv2.medianBlur(frame_prep, 3)
 
-                    if len(good) >= MIN_MEDIAN_MATCHES:
-                        src_pts = np.float32(
-                            [self.ref_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                        dst_pts = np.float32(
-                            [kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        frame_kp, frame_des = self.detector.detectAndCompute(frame_prep, None)
 
-                        # Thử homography
-                        if len(good) >= MIN_GOOD_MATCHES:
-                            H, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-                            if self._validate_homography(H):
-                                dst_corners = cv2.perspectiveTransform(self.ref_pts, H)
-                                rect = cv2.boundingRect(dst_corners)
-                                bx, by, bw, bh = rect
-                                if self._validate_bbox(bx, by, bw, bh, fw, fh):
-                                    sx, sy, sw, sh = bx, by, bw, bh
-                                    surf_ok = True
+        if frame_des is None or len(frame_kp) < 3:
+            return False, self.roi_bbox
 
-                        # Fallback: median-shift
-                        if not surf_ok:
-                            mx, my, mw, mh = self._median_shift_bbox(src_pts, dst_pts)
-                            if self._validate_bbox(mx, my, mw, mh, fw, fh):
-                                sx, sy, sw, sh = mx, my, mw, mh
-                                surf_ok = True
-                except cv2.error:
-                    pass
+        # Match features
+        try:
+            matches = self.matcher.match(self.roi_des, frame_des)
+            matches = sorted(matches, key=lambda x: x.distance)
+        except:
+            return False, self.roi_bbox
 
-        # ===== Bước 2: Template matching fallback/verification =====
-        tmpl_ok = False
-        tx, ty, tw, th = 0, 0, 0, 0
+        # Cần ít nhất 3 matches để tính toán
+        if len(matches) < 3:
+            return False, self.roi_bbox
 
-        if self.ref_template is not None:
-            tmpl_ok, (tx, ty, tw, th) = self._template_match(gray, fw, fh)
+        # Lấy top matches tốt nhất
+        good_count = max(3, len(matches) // 2)
+        good_matches = matches[:good_count]
 
-        # ===== Bước 3: Chọn kết quả tốt nhất =====
-        if surf_ok and tmpl_ok:
-            # Cả 2 OK → dùng SURF (chính xác hơn) nhưng kiểm tra consistency
-            dist = np.sqrt((sx - tx)**2 + (sy - ty)**2)
-            orig_w, orig_h = self.ref_bbox_wh
-            max_dist = max(orig_w, orig_h) * 1.5
-            if dist < max_dist:
-                x, y, w, h = sx, sy, sw, sh  # consistent → dùng SURF
-            else:
-                x, y, w, h = tx, ty, tw, th  # inconsistent → tin template hơn
-        elif surf_ok:
-            x, y, w, h = sx, sy, sw, sh
-        elif tmpl_ok:
-            x, y, w, h = tx, ty, tw, th
-        else:
-            self.lost_count += 1
-            return False, (0, 0, 0, 0)
+        # Extract matched points
+        src_pts = cv2.KeyPoint_convert([self.roi_kp[m.queryIdx] for m in good_matches])
+        dst_pts = cv2.KeyPoint_convert([frame_kp[m.trainIdx] for m in good_matches])
 
-        x = max(0, min(fw - w, x))
-        y = max(0, min(fh - h, y))
+        src_pts = src_pts.reshape(-1, 1, 2).astype('float32')
+        dst_pts = dst_pts.reshape(-1, 1, 2).astype('float32')
 
-        self.last_bbox = (x, y, w, h)
-        self.lost_count = 0
-        self.success_count += 1
+        # Tính homography matrix
+        try:
+            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if H is None:
+                return False, self.roi_bbox
+        except:
+            return False, self.roi_bbox
 
-        # Chỉ update reference mỗi ADAPT_INTERVAL frames (tránh drift)
-        if self.success_count % ADAPT_INTERVAL == 0:
-            self._update_reference(frame, (x, y, w, h))
+        # Transform ROI corners
+        x, y, w, h = self.roi_bbox
+        corners = np.array([
+            [0, 0],
+            [w, 0],
+            [w, h],
+            [0, h]
+        ], dtype='float32').reshape(-1, 1, 2)
 
-        return True, (x, y, w, h)
+        try:
+            transformed = cv2.perspectiveTransform(corners, H)
+            pts = transformed.reshape(-1, 2)
+
+            # Tính bounding box từ transformed points
+            left = int(max(0, np.min(pts[:, 0])))
+            top = int(max(0, np.min(pts[:, 1])))
+            right = int(np.max(pts[:, 0]))
+            bottom = int(np.max(pts[:, 1]))
+
+            new_w = max(1, right - left)
+            new_h = max(1, bottom - top)
+
+            self.roi_bbox = (left, top, new_w, new_h)
+            return True, self.roi_bbox
+        except:
+            return False, self.roi_bbox
+
+    def _update_template_match(self, frame):
+        """Ultra-robust template matching fallback"""
+        if self.roi_template is None or self.roi_template.size == 0:
+            return False, self.roi_bbox
+
+        try:
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            x, y, w, h = self.roi_bbox
+
+            # Search in expanded region
+            search_x = max(0, x - w // 2)
+            search_y = max(0, y - h // 2)
+            search_w = min(frame_gray.shape[1] - search_x, w * 2)
+            search_h = min(frame_gray.shape[0] - search_y, h * 2)
+
+            if search_w < w or search_h < h:
+                return False, self.roi_bbox
+
+            search_region = frame_gray[search_y:search_y+search_h, search_x:search_x+search_w]
+
+            # Resize template if needed
+            template = self.roi_template
+            if template.shape[0] > search_h or template.shape[1] > search_w:
+                scale = min(search_h / template.shape[0], search_w / template.shape[1])
+                new_size = (int(template.shape[1] * scale), int(template.shape[0] * scale))
+                template = cv2.resize(template, new_size, interpolation=cv2.INTER_LINEAR)
+
+            result = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+            if max_val > 0:
+                top_left = max_loc
+                new_x = search_x + top_left[0]
+                new_y = search_y + top_left[1]
+                new_w = template.shape[1]
+                new_h = template.shape[0]
+
+                self.roi_bbox = (new_x, new_y, new_w, new_h)
+                return True, self.roi_bbox
+            return False, self.roi_bbox
+        except:
+            return False, self.roi_bbox
+
+    def _create_csrt_tracker(self):
+        if hasattr(cv2, "TrackerCSRT_create"):
+            return cv2.TrackerCSRT_create()
+
+        legacy = getattr(cv2, "legacy", None)
+        if legacy is not None and hasattr(legacy, "TrackerCSRT_create"):
+            return legacy.TrackerCSRT_create()
+        return None
 
 
 class VideoLabel(QtWidgets.QLabel):
@@ -429,7 +375,7 @@ class VideoLabel(QtWidgets.QLabel):
 class MainWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SURF Tracking - MP4 loop")
+        self.setWindowTitle("Object Tracking - MP4 loop (No Serial)")
         self.resize(1100, 700)
 
         # video
@@ -464,20 +410,29 @@ class MainWindow(QtWidgets.QWidget):
     # ---------- UI ----------
     def build_ui(self):
         root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
         top = QtWidgets.QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(5)
         root.addLayout(top, 1)
 
         self.video_label = VideoLabel()
-        self.video_label.setMinimumSize(800, 450)
+        self.video_label.setFixedSize(800, 450)  # cố định kích thước để tránh giật
         self.video_label.roiSelected.connect(self.on_roi_selected)
-        top.addWidget(self.video_label, 3)
+        top.addWidget(self.video_label, 0)  # stretch = 0 để không resize
 
         side = QtWidgets.QVBoxLayout()
-        top.addLayout(side, 1)
+        side.setContentsMargins(5, 0, 0, 0)
+        side.setSpacing(5)
+        top.addLayout(side, 0)
 
         gb_video = QtWidgets.QGroupBox("Video (.mp4)")
+        gb_video.setMaximumHeight(120)
         side.addWidget(gb_video)
         v = QtWidgets.QVBoxLayout(gb_video)
+        v.setContentsMargins(5, 5, 5, 5)
+        v.setSpacing(3)
 
         row = QtWidgets.QHBoxLayout()
         self.edt_path = QtWidgets.QLineEdit()
@@ -489,8 +444,11 @@ class MainWindow(QtWidgets.QWidget):
         v.addLayout(row)
 
         gb_ctrl = QtWidgets.QGroupBox("Điều khiển")
+        gb_ctrl.setMaximumHeight(200)
         side.addWidget(gb_ctrl)
         g = QtWidgets.QGridLayout(gb_ctrl)
+        g.setContentsMargins(5, 5, 5, 5)
+        g.setSpacing(5)
 
         self.btn_start = QtWidgets.QPushButton("Start")
         self.btn_pause = QtWidgets.QPushButton("Pause")
@@ -575,6 +533,8 @@ class MainWindow(QtWidgets.QWidget):
                 self.log("Resume")
 
     def reset_tracking(self, checked=False, inform=True):
+        self.setUpdatesEnabled(False)
+
         self.tracker = None
         self.tracking = False
         self.objX = self.objY = self.areaObj = 0.0
@@ -585,6 +545,8 @@ class MainWindow(QtWidgets.QWidget):
 
         # đè frame sạch ngay để xoá khung cũ
         self.refresh_view()
+
+        self.setUpdatesEnabled(True)
 
         if inform:
             self.set_status("Reset tracking (select ROI again)")
@@ -601,25 +563,38 @@ class MainWindow(QtWidgets.QWidget):
             if self.timer.isActive():
                 self.timer.stop()
 
+            # block layout updates để tránh giật
+            self.setUpdatesEnabled(False)
+
             self.video_label.enable_selection(True)
             self.btn_roi.setText("Đang chọn ROI... (bấm để tắt)")
             self.set_status("ROI mode ON (video paused) - kéo thả trên video")
+
+            # luôn refresh frame sạch để tránh còn bbox cũ
+            self.refresh_view()
+
+            self.setUpdatesEnabled(True)
+            self.update()
 
             if auto:
                 self.log("Tracking lost -> AUTO bật ROI mode (video paused).")
             else:
                 self.log("ROI mode ON: video tạm dừng để chọn ROI mượt.")
 
-            # luôn refresh frame sạch để tránh còn bbox cũ
-            self.refresh_view()
-
         else:
             if not getattr(self.video_label, "_select_enabled", False):
                 return
 
+            # block layout updates
+            self.setUpdatesEnabled(False)
+
             self.video_label.enable_selection(False)
             self.btn_roi.setText("Chọn ROI (kéo trên video)")
             self.set_status("ROI mode OFF")
+
+            self.setUpdatesEnabled(True)
+            self.update()
+
             self.log("ROI mode OFF")
 
             # resume có delay nhỏ để tránh giật ngay sau thả chuột
@@ -645,8 +620,14 @@ class MainWindow(QtWidgets.QWidget):
             return
 
         try:
-            self.tracker = SurfTracker()
+            # block updates khi init tracker để tránh giật
+            self.setUpdatesEnabled(False)
+
+            self.tracker = create_tracker()
             ok = self.tracker.init(self.raw_frame, (x, y, w, h))
+
+            self.setUpdatesEnabled(True)
+
             if ok:
                 self.tracking = True
                 self._lost_reported = False
@@ -654,9 +635,16 @@ class MainWindow(QtWidgets.QWidget):
                 self.video_label.enable_selection(False)
                 self.btn_roi.setText("Chọn ROI (kéo trên video)")
                 self.set_status(f"Tracking ON: ({x},{y},{w},{h})")
-                self.log(f"Init tracker OK: ({x},{y},{w},{h})")
 
-                # reset FPS smoothing để tránh “giật” ngay sau init
+                # Log which tracker method was selected
+                if hasattr(self.tracker, 'use_template') and self.tracker.use_template:
+                    self.log(f"✓ Tracker initialized (Template Matching mode): ({x},{y},{w},{h})")
+                elif hasattr(self.tracker, 'use_csrt') and self.tracker.use_csrt:
+                    self.log(f"✓ Tracker initialized (CSRT mode): ({x},{y},{w},{h})")
+                else:
+                    self.log(f"✓ Tracker initialized (Feature-based mode): ({x},{y},{w},{h})")
+
+                # reset FPS smoothing để tránh "giật" ngay sau init
                 self._prev_t = time.time()
                 self._fps = 0.0
 
@@ -665,8 +653,13 @@ class MainWindow(QtWidgets.QWidget):
                     QtCore.QTimer.singleShot(60, self.timer.start)
                 self._resume_after_roi = False
             else:
-                self.log("Init tracker FAILED. Thử chọn ROI khác.")
+                detail = getattr(self.tracker, "last_error", "")
+                if detail:
+                    self.log(f"⚠ Init tracker FAILED: {detail}")
+                else:
+                    self.log("⚠ Init tracker FAILED. Thử chọn ROI khác.")
         except Exception as e:
+            self.setUpdatesEnabled(True)
             self.log(f"Lỗi tracker: {e}")
 
     # ---------- Frame update ----------
@@ -753,7 +746,7 @@ class MainWindow(QtWidgets.QWidget):
         label_w = max(1, self.video_label.width())
         label_h = max(1, self.video_label.height())
 
-        # keep aspect ratio
+        # keep aspect ratio (cố định 800x450)
         scale = min(label_w / w, label_h / h)
         new_w = max(1, int(w * scale))
         new_h = max(1, int(h * scale))
@@ -765,7 +758,7 @@ class MainWindow(QtWidgets.QWidget):
         qimg = QtGui.QImage(resized.data, new_w, new_h, new_w * 3, QtGui.QImage.Format_RGB888)
         pm = QtGui.QPixmap.fromImage(qimg)
 
-        # ✅ Không tạo canvas to bằng label nữa -> giảm giật
+        # set pixmap trực tiếp không qua event queue -> response lập tức
         self.video_label.setPixmap(pm)
         self.video_label.set_frame_geometry_info(w, h, scale, offset_x, offset_y)
 
