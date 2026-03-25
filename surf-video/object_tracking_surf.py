@@ -808,14 +808,17 @@ class MainWindow(QtWidgets.QWidget):
                 if self._consecutive_lost_for_roi >= 5:
                     if not self._lost_reported:
                         self._lost_reported = True
-                        self.log(f"Tracking lost for {self._consecutive_lost_for_roi} frames -> tự bật ROI mode.")
+                        self.log(f"Tracking lost for {self._consecutive_lost_for_roi} frames -> dừng video để chọn ROI.")
                         # Reset tracker to stop attempting failed updates
                         self.tracking = False
                         self.tracker = None
-                        # Immediately refresh to clear old bbox from display
+                        # STOP video immediately to allow ROI selection
+                        if self.timer.isActive():
+                            self.timer.stop()
+                        # Refresh display to show clean frame with RED bbox
                         self.refresh_view()
-                        # bật ROI mode với delay để ensure UI stable
-                        QtCore.QTimer.singleShot(150, lambda: self.on_auto_roi_activation())
+                        # Activate ROI mode with small delay để ensure UI stable
+                        QtCore.QTimer.singleShot(100, lambda: self.on_auto_roi_activation())
 
         # FPS
         now = time.time()
