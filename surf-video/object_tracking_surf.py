@@ -782,10 +782,21 @@ class MainWindow(QtWidgets.QWidget):
                 # LOST: increment lost counter and show RED bbox
                 self._consecutive_lost_for_roi += 1
 
-                # Get last known bbox position (from tracker)
-                if hasattr(self.tracker, 'roi_bbox') and self.tracker.roi_bbox is not None:
-                    x, y, w, h = self.tracker.roi_bbox
-                    # Draw tracking bbox in RED (lost)
+                # Try to get last known bbox position (prefer last_valid_bbox over roi_bbox)
+                bbox_to_draw = None
+                if hasattr(self.tracker, 'last_valid_bbox') and self.tracker.last_valid_bbox is not None:
+                    bbox_to_draw = self.tracker.last_valid_bbox
+                elif hasattr(self.tracker, 'roi_bbox') and self.tracker.roi_bbox is not None:
+                    bbox_to_draw = self.tracker.roi_bbox
+
+                # Draw tracking bbox in RED (lost) if we have a position
+                if bbox_to_draw is not None:
+                    x, y, w, h = [int(v) for v in bbox_to_draw]
+                    x = max(0, min(self.frame_w - 1, x))
+                    y = max(0, min(self.frame_h - 1, y))
+                    w = max(1, min(self.frame_w - x, w))
+                    h = max(1, min(self.frame_h - y, h))
+
                     cv2.rectangle(display, (x, y), (x + w, y + h), (0, 0, 255), 2)
                     cx, cy = x + w // 2, y + h // 2
                     cv2.circle(display, (cx, cy), 4, (0, 0, 255), -1)
