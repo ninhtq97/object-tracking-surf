@@ -110,10 +110,21 @@ def _match_and_render(
     if des1 is None or des2 is None or len(kp1) < 2 or len(kp2) < 2:
         raise RuntimeError("Không đủ keypoints để so khớp giữa hai ảnh")
 
-    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
-    matches = matcher.match(des1, des2)
-    matches = sorted(matches, key=lambda m: m.distance)
-    matches = matches[:min(100, len(matches))]
+    # Theo OpenCV SURF docs: dùng FLANN + Lowe ratio test cho descriptor float.
+    des1 = des1.astype(np.float32, copy=False)
+    des2 = des2.astype(np.float32, copy=False)
+
+    matcher = cv2.DescriptorMatcher_create(cv2.DescriptorMatcher_FLANNBASED)
+    knn_matches = matcher.knnMatch(des1, des2, 2)
+
+    ratio_thresh = 0.7
+    matches = []
+    for pair in knn_matches:
+        if len(pair) < 2:
+            continue
+        m, n = pair
+        if m.distance < ratio_thresh * n.distance:
+            matches.append(m)
 
     matched_vis = cv2.drawMatches(
         img1,
@@ -208,8 +219,9 @@ def launch_ui(output_dir="outputs"):
 
     custom_css = """
     .gradio-container {
+        width: 100%;
         max-width: 1100px !important;
-        margin: 0 auto;
+        align-self: center;
         background: linear-gradient(135deg, #f5f7fa 0%, #e4ecf7 100%);
     }
     .block-title {
@@ -217,20 +229,23 @@ def launch_ui(output_dir="outputs"):
         font-size: 32px;
         font-weight: 700;
         margin-bottom: 8px;
+        color: #000;
     }
     .block-subtitle {
         text-align: center;
         color: #3c4a63;
         margin-bottom: 20px;
     }
-    .panel-card {
-        border-radius: 16px;
-        border: 1px solid #d7e1ef;
-        box-shadow: 0 8px 24px rgba(13, 38, 76, 0.08);
-    }
     .submit-row {
         display: flex;
         justify-content: center;
+    }
+    .gradio-container-6-9-0 .prose h3 {
+        color: #000;
+    }
+    .input-row {
+        display: flex;
+        gap: 16px;
     }
     """
 
@@ -238,7 +253,7 @@ def launch_ui(output_dir="outputs"):
         gr.HTML("<div class='block-title'>SURF Feature Matching</div>")
         gr.HTML("<div class='block-subtitle'>Chọn 2 ảnh, trích xuất đặc trưng và xem kết quả so khớp ngay</div>")
 
-        with gr.Row(equal_height=True):
+        with gr.Row(equal_height=True, elem_classes=["input-row"]):
             with gr.Column(elem_classes=["panel-card"]):
                 gr.Markdown("### Ảnh 1")
                 image1_input = gr.Image(

@@ -15,7 +15,7 @@ Dự án này triển khai thuật toán **so khớp đặc trưng SURF** giữa
 
 ### Yêu cầu
 
-- Python 3.6+
+- Python 3.8+
 - OpenCV với SURF support (yêu cầu build từ source với `OPENCV_ENABLE_NONFREE=ON`)
 
 ### Cài đặt thư viện
