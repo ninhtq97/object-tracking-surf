@@ -15,7 +15,8 @@ class SurfTracker:
     def __init__(self):
         self.orb = cv2.ORB_create(nfeatures=2000)
         self.akaze = cv2.AKAZE_create()
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        # Use BFMatcher for binary descriptors (ORB/AKAZE), NOT FLANN
+        self.matcher_bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self.detector = self.orb
 
         self.csrt_tracker = None
@@ -29,6 +30,10 @@ class SurfTracker:
         self.roi_bbox = None
         self.roi_template = None
         self.initialized = False
+
+        # Frame-to-frame smoothing and lost tracking handling
+        self.last_valid_bbox = None
+        self.consecutive_lost_frames = 0  # Counter for consecutive tracking failures
 
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
@@ -62,8 +67,11 @@ class SurfTracker:
         # Try feature-based detection với multiple preprocessing
         roi_gray = cv2.cvtColor(self.roi_frame, cv2.COLOR_BGR2GRAY)
 
+        # Normalize histogram để robust với brightness changes
+        roi_normalized = cv2.normalize(roi_gray, None, 0, 255, cv2.NORM_MINMAX)
+
         # Strategy 1: CLAHE + denoising
-        roi_prep = self.clahe.apply(roi_gray)
+        roi_prep = self.clahe.apply(roi_normalized)
         roi_prep = cv2.medianBlur(roi_prep, 3)
 
         kp, des = self._try_detect_features(roi_prep)
@@ -71,16 +79,15 @@ class SurfTracker:
 
         # Strategy 2: Histogram equalization + AKAZE if ORB fails
         if des is None or len(kp) < 3:
-            roi_eq = cv2.equalizeHist(roi_gray)
+            roi_eq = cv2.equalizeHist(roi_normalized)
             roi_eq = cv2.medianBlur(roi_eq, 3)
             kp, des = self._try_detect_akaze(roi_eq)
             detector_used = "AKAZE"
 
-        # Strategy 3: Simple histogram equalization
+        # Strategy 3: Simple normalized grayscale
         if des is None or len(kp) < 3:
-            roi_eq = cv2.equalizeHist(roi_gray)
-            kp, des = self.orb.detectAndCompute(roi_eq, None)
-            detector_used = "ORB+EQ"
+            kp, des = self.orb.detectAndCompute(roi_normalized, None)
+            detector_used = "ORB+NORM"
 
         # Success with feature detection
         if des is not None and len(kp) >= 3:
@@ -155,9 +162,10 @@ class SurfTracker:
         if self.roi_des is None or len(self.roi_kp) < 3:
             return False, self.roi_bbox
 
-        # Tìm features trong frame hiện tại
+        # Tìm features trong frame hiện tại với preprocessing giống ROI
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame_prep = self.clahe.apply(frame_gray)
+        frame_normalized = cv2.normalize(frame_gray, None, 0, 255, cv2.NORM_MINMAX)
+        frame_prep = self.clahe.apply(frame_normalized)
         frame_prep = cv2.medianBlur(frame_prep, 3)
 
         frame_kp, frame_des = self.detector.detectAndCompute(frame_prep, None)
@@ -165,20 +173,30 @@ class SurfTracker:
         if frame_des is None or len(frame_kp) < 3:
             return False, self.roi_bbox
 
-        # Match features
+        # Match features với Lowe's ratio test (robust matching)
         try:
-            matches = self.matcher.match(self.roi_des, frame_des)
-            matches = sorted(matches, key=lambda x: x.distance)
+            matches_raw = self.matcher_bf.knnMatch(self.roi_des, frame_des, k=2)
+            if matches_raw is None or len(matches_raw) == 0:
+                return False, self.roi_bbox
+
+            # Apply Lowe's ratio test để filter outliers
+            good_matches = []
+            for pair in matches_raw:
+                if len(pair) == 2:
+                    m, n = pair
+                    # Ratio threshold được hạ xuống từ 0.75 để robust hơn với brightness changes
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
+                elif len(pair) == 1:
+                    # Nếu chỉ có 1 match (edge case), accept nếu distance nhỏ
+                    if pair[0].distance < 50:
+                        good_matches.append(pair[0])
         except:
             return False, self.roi_bbox
 
         # Cần ít nhất 3 matches để tính toán
-        if len(matches) < 3:
+        if len(good_matches) < 3:
             return False, self.roi_bbox
-
-        # Lấy top matches tốt nhất
-        good_count = max(3, len(matches) // 2)
-        good_matches = matches[:good_count]
 
         # Extract matched points
         src_pts = cv2.KeyPoint_convert([self.roi_kp[m.queryIdx] for m in good_matches])
@@ -187,11 +205,17 @@ class SurfTracker:
         src_pts = src_pts.reshape(-1, 1, 2).astype('float32')
         dst_pts = dst_pts.reshape(-1, 1, 2).astype('float32')
 
-        # Tính homography matrix
+        # Tính homography matrix với RANSAC
         try:
             H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
             if H is None:
                 return False, self.roi_bbox
+
+            # Validate homography: kiểm tra inlier ratio
+            if mask is not None:
+                inlier_ratio = np.sum(mask) / len(mask)
+                if inlier_ratio < 0.3:  # Quá ít inliers -> bad homography
+                    return False, self.roi_bbox
         except:
             return False, self.roi_bbox
 
@@ -217,13 +241,31 @@ class SurfTracker:
             new_w = max(1, right - left)
             new_h = max(1, bottom - top)
 
+            # Sanity check: không cho phép bbox thay đổi quá many
+            old_w, old_h = w, h
+            size_change_ratio = (new_w * new_h) / (old_w * old_h)
+            if size_change_ratio < 0.2 or size_change_ratio > 5.0:
+                # Size thay đổi quá lớn -> likely wrong match
+                return False, self.roi_bbox
+
+            # Validate bbox changed smoothly (not jumping)
+            if self.last_valid_bbox is not None:
+                old_x, old_y, old_w, old_h = self.last_valid_bbox
+                # Check if bbox movement is reasonable
+                center_dist = abs(left + new_w//2 - (old_x + old_w//2)) + abs(top + new_h//2 - (old_y + old_h//2))
+                if center_dist > max(old_w, old_h) * 2:
+                    # Center jumped too far -> likely wrong match
+                    return False, self.roi_bbox
+
             self.roi_bbox = (left, top, new_w, new_h)
+            self.last_valid_bbox = self.roi_bbox
+            self.consecutive_lost_frames = 0  # Reset lost counter on success
             return True, self.roi_bbox
         except:
             return False, self.roi_bbox
 
     def _update_template_match(self, frame):
-        """Ultra-robust template matching fallback"""
+        """Ultra-robust template matching fallback with strict validation"""
         if self.roi_template is None or self.roi_template.size == 0:
             return False, self.roi_bbox
 
@@ -252,14 +294,25 @@ class SurfTracker:
             result = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF)
             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
 
-            if max_val > 0:
+            # Higher threshold for template matching to avoid false positives
+            if max_val > 1000:  # Stricter threshold
                 top_left = max_loc
                 new_x = search_x + top_left[0]
                 new_y = search_y + top_left[1]
                 new_w = template.shape[1]
                 new_h = template.shape[0]
 
+                # Validate movement isn't too large
+                if self.last_valid_bbox is not None:
+                    old_x, old_y, old_w, old_h = self.last_valid_bbox
+                    center_dist = abs(new_x + new_w//2 - (old_x + old_w//2)) + abs(new_y + new_h//2 - (old_y + old_h//2))
+                    if center_dist > max(old_w, old_h) * 3:
+                        # Movement too large -> spurious match
+                        return False, self.roi_bbox
+
                 self.roi_bbox = (new_x, new_y, new_w, new_h)
+                self.last_valid_bbox = self.roi_bbox
+                self.consecutive_lost_frames = 0
                 return True, self.roi_bbox
             return False, self.roi_bbox
         except:
@@ -404,6 +457,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self._resume_after_roi = False
         self._lost_reported = False
+        self._consecutive_lost_for_roi = 0  # Consecutive lost frames before auto ROI
 
         self.build_ui()
 
@@ -539,6 +593,7 @@ class MainWindow(QtWidgets.QWidget):
         self.tracking = False
         self.objX = self.objY = self.areaObj = 0.0
         self._lost_reported = False
+        self._consecutive_lost_for_roi = 0  # Reset lost counter
 
         self.video_label.enable_selection(False)
         self.btn_roi.setText("Chọn ROI (kéo trên video)")
@@ -562,6 +617,11 @@ class MainWindow(QtWidgets.QWidget):
             self._resume_after_roi = self.timer.isActive()
             if self.timer.isActive():
                 self.timer.stop()
+
+            # Ensure tracking is fully stopped
+            if self.tracking or self.tracker is not None:
+                self.tracking = False
+                self.tracker = None
 
             # block layout updates để tránh giật
             self.setUpdatesEnabled(False)
@@ -608,6 +668,16 @@ class MainWindow(QtWidgets.QWidget):
             return
         enabled = not getattr(self.video_label, "_select_enabled", False)
         self.set_roi_mode(enabled, auto=False)
+
+    def on_auto_roi_activation(self):
+        """Safely activate ROI mode when tracking is lost"""
+        # Double check that tracking is indeed off
+        if self.tracking or self.tracker is not None:
+            self.tracking = False
+            self.tracker = None
+
+        # Activate ROI selection mode
+        self.set_roi_mode(True, auto=True)
 
     def on_roi_selected(self, bbox):
         if self.raw_frame is None:
@@ -693,6 +763,7 @@ class MainWindow(QtWidgets.QWidget):
                 w = max(1, min(self.frame_w - x, w))
                 h = max(1, min(self.frame_h - y, h))
 
+                # Draw tracking bbox in GREEN (success)
                 cv2.rectangle(display, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cx, cy = x + w // 2, y + h // 2
                 cv2.circle(display, (cx, cy), 4, (0, 255, 0), -1)
@@ -705,20 +776,35 @@ class MainWindow(QtWidgets.QWidget):
                             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
 
                 self._lost_reported = False
+                self._consecutive_lost_for_roi = 0  # Reset lost counter on success
 
             else:
-                # LOST: xóa tracker để chắc chắn không giữ bbox
-                self.tracking = False
-                self.tracker = None
+                # LOST: increment lost counter and show RED bbox
+                self._consecutive_lost_for_roi += 1
 
-                cv2.putText(display, "Tracking LOST - ROI auto ON",
+                # Get last known bbox position (from tracker)
+                if hasattr(self.tracker, 'roi_bbox') and self.tracker.roi_bbox is not None:
+                    x, y, w, h = self.tracker.roi_bbox
+                    # Draw tracking bbox in RED (lost)
+                    cv2.rectangle(display, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                    cx, cy = x + w // 2, y + h // 2
+                    cv2.circle(display, (cx, cy), 4, (0, 0, 255), -1)
+
+                cv2.putText(display, f"🔴 Tracking LOST ({self._consecutive_lost_for_roi} frame)",
                             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-                if not self._lost_reported:
-                    self._lost_reported = True
-                    self.log("Tracking lost -> tự bật ROI mode.")
-                    # bật ROI mode và refresh frame sạch để không còn bbox cũ
-                    QtCore.QTimer.singleShot(0, lambda: self.set_roi_mode(True, auto=True))
+                # Only auto-enable ROI after sustained loss (5+ consecutive frames)
+                if self._consecutive_lost_for_roi >= 5:
+                    if not self._lost_reported:
+                        self._lost_reported = True
+                        self.log(f"Tracking lost for {self._consecutive_lost_for_roi} frames -> tự bật ROI mode.")
+                        # Reset tracker to stop attempting failed updates
+                        self.tracking = False
+                        self.tracker = None
+                        # Immediately refresh to clear old bbox from display
+                        self.refresh_view()
+                        # bật ROI mode với delay để ensure UI stable
+                        QtCore.QTimer.singleShot(150, lambda: self.on_auto_roi_activation())
 
         # FPS
         now = time.time()
