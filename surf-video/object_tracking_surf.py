@@ -25,9 +25,8 @@ class SurfTracker:
     API tương thích: init(frame, bbox) -> bool, update(frame) -> (ok, bbox)
     """
 
-    def __init__(self, hessian_threshold=100):
-        self.surf = cv2.xfeatures2d.SURF_create(hessian_threshold)
-        self.surf.setExtended(True)   # 128-dim descriptors
+    def __init__(self, hessian_threshold=400):
+        self.surf = cv2.xfeatures2d.SURF_create(hessian_threshold, extended=False, upright=False)
         self.bf = cv2.BFMatcher(cv2.NORM_L2)  # BF ổn định hơn FLANN cho ít features
 
         self.ref_kp = None
